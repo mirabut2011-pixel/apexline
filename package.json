@@ -1,0 +1,10 @@
+{
+  "name": "apexline",
+  "version": "1.0.0",
+  "private": true,
+  "description": "APEXLINE browser racing game + server (accounts, cloud saves, leaderboards)",
+  "type": "module",
+  "scripts": { "start": "node server.mjs" },
+  "engines": { "node": ">=18" },
+  "dependencies": { "pg": "^8.13.1" }
+}
