@@ -11,7 +11,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 
-const VERSION = 1;
+const VERSION = 2;
 const PORT = Number(process.env.PORT) || 10000;
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
 const GAME_FILE = [path.join(ROOT, 'index.html'), path.join(ROOT, '..', 'index.html')].find((p) => fs.existsSync(p));
@@ -21,6 +21,7 @@ const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS ?? 'https://mirabut2011-pix
 // Minimum plausible lap times (ms), from track length at the fastest possible speed with nitro, minus 10 %.
 const MAPS = { harbor: 24500, canyon: 25000, alpine: 21100 };
 const CARS = ['kestrel', 'vanta', 'mako', 'lumen', 'stratos', 'bastion', 'halcyon', 'oni', 'aurora'];
+const GUEST_HASH = 'guest$';
 const NAME_RE = /^[A-Za-z0-9_\-. ]{3,16}$/;
 
 // ───────────────────────────────────────────── storage
@@ -40,6 +41,10 @@ function createMemoryStore() {
     async userById(id) { return users.get(id) ?? null; },
     async nameTaken(lc, exceptId) { for (const u of users.values()) if (u.username_lc === lc && u.id !== exceptId) return true; return false; },
     async saveProfile(id, profile, username, pub) { const u = users.get(id); if (u) Object.assign(u, { profile, username, username_lc: username.toLowerCase(), public_profile: pub }); },
+    async claimUser(id, username, email, hash) {
+      for (const x of users.values()) { if (x.id === id) continue; if (x.username_lc === username.toLowerCase()) return 'name'; if (email && x.email_lc === email.toLowerCase()) return 'email'; }
+      const u = users.get(id); Object.assign(u, { username, username_lc: username.toLowerCase(), email, email_lc: email ? email.toLowerCase() : null, pass_hash: hash }); return null;
+    },
     async deleteUser(id) { users.delete(id); for (const [k, s] of sessions) if (s === id) sessions.delete(k); for (const k of laps.keys()) if (k.startsWith(id + '|')) laps.delete(k); },
     async createSession(hash, id) { sessions.set(hash, id); },
     async sessionUser(hash) { const id = sessions.get(hash); return id ? users.get(id) ?? null : null; },
@@ -57,7 +62,7 @@ function createMemoryStore() {
       return 1 + [...laps.values()].filter((l) => l.map_id === mapId && l.lap_ms < mine.lap_ms).length;
     },
     async leagueBoard(limit) {
-      return [...users.values()].map((u) => ({ id: u.id, username: u.username, public_profile: u.public_profile, lp: u.profile.lp ?? 0, level: u.profile.level ?? 1 }))
+      return [...users.values()].filter((u) => (u.profile.stats?.races ?? 0) > 0).map((u) => ({ id: u.id, username: u.username, public_profile: u.public_profile, lp: u.profile.lp ?? 0, level: u.profile.level ?? 1 }))
         .sort((a, b) => b.lp - a.lp || b.level - a.level).slice(0, limit);
     },
     async leagueRank(id) { const me = users.get(id); if (!me) return null; return 1 + [...users.values()].filter((u) => (u.profile.lp ?? 0) > (me.profile.lp ?? 0)).length; },
@@ -106,6 +111,13 @@ async function createPgStore(url) {
       await q(`UPDATE apex_users SET profile = $2, username = $3, username_lc = $4, public_profile = $5, updated_at = now() WHERE id = $1`,
         [id, JSON.stringify(profile), username, username.toLowerCase(), pub]);
     },
+    async claimUser(id, username, email, hash) {
+      try {
+        await q(`UPDATE apex_users SET username = $2, username_lc = $3, email = $4, email_lc = $5, pass_hash = $6, updated_at = now() WHERE id = $1`,
+          [id, username, username.toLowerCase(), email, email ? email.toLowerCase() : null, hash]);
+        return null;
+      } catch (e) { if (e.code === '23505') return String(e.constraint ?? e.detail ?? '').includes('email') ? 'email' : 'name'; throw e; }
+    },
     async deleteUser(id) { await q(`DELETE FROM apex_users WHERE id = $1`, [id]); },
     async createSession(hash, id) { await q(`INSERT INTO apex_sessions (token_hash, user_id) VALUES ($1,$2)`, [hash, id]); },
     async sessionUser(hash) { return (await q(`SELECT u.* FROM apex_sessions s JOIN apex_users u ON u.id = s.user_id WHERE s.token_hash = $1`, [hash]))[0] ?? null; },
@@ -126,7 +138,7 @@ async function createPgStore(url) {
     },
     async leagueBoard(limit) {
       return q(`SELECT id, username, public_profile, COALESCE((profile->>'lp')::int, 0) AS lp, COALESCE((profile->>'level')::int, 1) AS level
-        FROM apex_users ORDER BY lp DESC, level DESC, created_at ASC LIMIT $1`, [limit]);
+        FROM apex_users WHERE COALESCE((profile->'stats'->>'races')::int, 0) > 0 ORDER BY lp DESC, level DESC, created_at ASC LIMIT $1`, [limit]);
     },
     async leagueRank(id) {
       const r = await q(`SELECT 1 + (SELECT count(*) FROM apex_users o WHERE COALESCE((o.profile->>'lp')::int,0) > COALESCE((m.profile->>'lp')::int,0))::int AS rank
@@ -167,10 +179,18 @@ function sanitizeProfile(p, base) {
   out.selectedCar = CARS.includes(src.selectedCar) ? src.selectedCar : out.ownedCars[0] ?? '';
   out.ownedPaints = strArr(src.ownedPaints, 40);
   out.paints = {}; for (const c of out.ownedCars) if (typeof src.paints?.[c] === 'string') out.paints[c] = src.paints[c].slice(0, 32);
-  out.upgrades = {}; for (const c of out.ownedCars) { const u = src.upgrades?.[c]; if (u) out.upgrades[c] = { engine: clampInt(u.engine, 0, 3, 0), grip: clampInt(u.grip, 0, 3, 0), nitro: clampInt(u.nitro, 0, 3, 0) }; }
+  out.upgrades = {}; for (const c of out.ownedCars) { const u = src.upgrades?.[c]; if (u) out.upgrades[c] = { engine: clampInt(u.engine, 0, 5, 0), turbo: clampInt(u.turbo, 0, 5, 0), grip: clampInt(u.grip, 0, 5, 0), aero: clampInt(u.aero, 0, 5, 0), nitro: clampInt(u.nitro, 0, 5, 0) }; }
   out.bests = {}; for (const m of Object.keys(MAPS)) { const b = src.bests?.[m]; if (b) out.bests[m] = { lap: Number(b.lap) || 0, race: Number(b.race) || 0 }; }
   const st = src.stats ?? {};
-  out.stats = { races: clampInt(st.races, 0, 1e7, 0), wins: clampInt(st.wins, 0, 1e7, 0), podiums: clampInt(st.podiums, 0, 1e7, 0), distanceKm: Math.max(0, Math.min(1e7, Number(st.distanceKm) || 0)) };
+  out.stats = { races: clampInt(st.races, 0, 1e7, 0), wins: clampInt(st.wins, 0, 1e7, 0), podiums: clampInt(st.podiums, 0, 1e7, 0), distanceKm: Math.max(0, Math.min(1e7, Number(st.distanceKm) || 0)),
+    overtakes: clampInt(st.overtakes, 0, 1e8, 0), perfectStarts: clampInt(st.perfectStarts, 0, 1e7, 0), nitroSec: clampInt(st.nitroSec, 0, 1e9, 0), topSpeed: clampInt(st.topSpeed, 0, 600, 0) };
+  // live-ops state (missions, pass, inventory, …): kept as small JSON blobs
+  for (const k of ['avatar', 'daily', 'weekly', 'login', 'achievements', 'pass', 'inventory', 'events']) {
+    const v = src[k];
+    if (v && typeof v === 'object') { try { if (JSON.stringify(v).length <= 20000) out[k] = v; } catch { /* drop */ } }
+  }
+  out.welcomed = !!src.welcomed;
+  out.updatedAt = clampInt(src.updatedAt, 0, Date.now() + 60_000, Date.now());
   out.history = Array.isArray(src.history) ? src.history.slice(0, 30).filter((h) => h && typeof h === 'object') : [];
   out.settings = src.settings && typeof src.settings === 'object' ? src.settings : base.settings;
   return out;
@@ -185,7 +205,8 @@ function baseProfile(id, username, email) {
   };
 }
 
-function profileOut(u) { return { ...u.profile, id: u.id, username: u.username, email: u.email ?? undefined, guest: false, createdAt: new Date(u.created_at).getTime() }; }
+function profileOut(u) { return { ...u.profile, id: u.id, username: u.username, email: u.email ?? undefined, guest: u.pass_hash === GUEST_HASH, createdAt: new Date(u.created_at).getTime() }; }
+const isClaimed = (u) => u.pass_hash !== GUEST_HASH;
 const publicName = (u) => (u.public_profile ? u.username : 'Anonymous driver');
 
 // very small in-memory rate limiter
@@ -268,12 +289,46 @@ async function main() {
       if (limited('login:' + ip(req), 30, 600_000) || limited('loginu:' + who, 10, 600_000)) throw new HttpError(429, 'Too many attempts. Wait a few minutes and try again.');
       const u = who ? await store.userByLogin(who) : null;
       if (!u || !(await checkPassword(String(b.password ?? ''), u.pass_hash))) throw new HttpError(401, 'Wrong driver name, email or password.');
-      return { token: await newSession(u.id), profile: profileOut(u) };
+      return { token: await newSession(u.id), profile: profileOut(u), claimed: true };
     },
 
     'POST /api/logout': async (req) => { const { tokHash } = await auth(req); await store.deleteSession(tokHash); return { ok: true }; },
 
-    'GET /api/me': async (req) => { const { u } = await auth(req); return { profile: profileOut(u) }; },
+    'GET /api/me': async (req) => { const { u } = await auth(req); return { profile: profileOut(u), claimed: isClaimed(u) }; },
+
+    // Instant play: an anonymous account, no registration. Can be protected later via /api/claim.
+    'POST /api/guest': async (req) => {
+      if (limited('guest:' + ip(req), 30, 3600_000)) throw new HttpError(429, 'Too many new players from this network. Try again later.');
+      const b = await readJson(req);
+      const id = crypto.randomUUID();
+      let username = String(b.profile?.username ?? '').trim();
+      if (!NAME_RE.test(username) || (await store.nameTaken(username.toLowerCase(), id))) username = '';
+      for (let i = 0; !username && i < 20; i++) { const n = 'Driver-' + Math.floor(1000 + Math.random() * 9000) + (i > 10 ? i : ''); if (!(await store.nameTaken(n.toLowerCase(), id))) username = n; }
+      if (!username) username = 'Driver-' + id.slice(0, 6);
+      const base = baseProfile(id, username, '');
+      const profile = b.profile ? sanitizeProfile(b.profile, base) : base;
+      const pub = profile.settings?.privacy?.publicProfile !== false;
+      const err = await store.createUser({ id, username, username_lc: username.toLowerCase(), email: null, email_lc: null, pass_hash: GUEST_HASH, profile, public_profile: pub });
+      if (err) throw new HttpError(409, 'Could not create a player right now, try again.');
+      const u = await store.userById(id);
+      return { token: await newSession(id), profile: profileOut(u), claimed: false };
+    },
+
+    // Protect an anonymous account with name + password (+ optional email) to use it on other devices.
+    'POST /api/claim': async (req) => {
+      const { u } = await auth(req);
+      const b = await readJson(req);
+      const username = String(b.username ?? '').trim(); const email = String(b.email ?? '').trim(); const password = String(b.password ?? '');
+      if (!NAME_RE.test(username)) throw new HttpError(400, 'Driver name: 3–16 characters (letters, numbers, space, _ - .).');
+      if (email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) throw new HttpError(400, 'Please enter a valid email or leave it empty.');
+      if (password.length < 8 || password.length > 200) throw new HttpError(400, 'Password must be at least 8 characters.');
+      if (await store.nameTaken(username.toLowerCase(), u.id)) throw new HttpError(409, 'That driver name is already taken.');
+      const err = await store.claimUser(u.id, username, email || null, await hashPassword(password));
+      if (err === 'email') throw new HttpError(409, 'An account with this email already exists.');
+      if (err === 'name') throw new HttpError(409, 'That driver name is already taken.');
+      const nu = await store.userById(u.id);
+      return { profile: profileOut(nu), claimed: true };
+    },
 
     'PUT /api/profile': async (req) => {
       const { u } = await auth(req);
